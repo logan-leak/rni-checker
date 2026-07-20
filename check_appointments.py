@@ -1,34 +1,18 @@
 #!/usr/bin/env python3
 """
-Checks the Breda RNI appointment booking widget for open slots in August 2026,
-and emails you when it finds any (with extra emphasis if Aug 19 specifically
-is open). Designed to be run on a schedule by GitHub Actions, but also runs
-fine from your own machine.
+Breda RNI appointment checker.
 
-HOW IT WORKS
-------------
-This site (mijnafspraakmaken.nl / JCC-Afspraken) doesn't expose a public
-JSON API, so this script drives a real (headless) browser with Playwright,
-loads the booking calendar, navigates to August 2026, and reads which days
-are marked as available.
+What this script does:
+- Opens the Breda RNI booking page with Playwright.
+- Navigates to August 2026.
+- Detects which days are available.
+- Sends an email when new relevant openings appear.
+- Supports --test-email to verify SMTP without needing Playwright.
 
-Because every municipality's calendar widget is built a little differently,
-the "is this day available" detection uses a few heuristics. If the site's
-HTML doesn't match what we expect, the script will:
-  - save a screenshot (debug_screenshot.png) and full page HTML
-    (debug_page.html) so we can see what happened, and
-  - exit with an error instead of silently reporting "nothing found".
-
-STATE / DE-DUPING
-------------------
-Previously-seen available dates are stored in state.json so you only get
-emailed about *new* openings, not the same ones every 15 minutes. The GitHub
-Actions workflow commits state.json back to the repo after each run.
-
-TEST MODE
----------
-Run with --test-email to send a one-off email using the configured SMTP
-settings. This is the fastest way to verify that email delivery works.
+Design goals:
+- Robust enough for GitHub Actions.
+- Safe SMTP port handling.
+- Separate test-email mode so you can confirm email delivery independently.
 """
 
 from __future__ import annotations
@@ -41,18 +25,13 @@ import smtplib
 import sys
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
-from playwright.sync_api import sync_playwright
-
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
 BOOKING_URL = "https://breda.mijnafspraakmaken.nl/?lang=en&link=6adf&product=45"
+
 TARGET_YEAR = 2026
 TARGET_MONTH = 8  # August
 PREFERRED_DAY = 19
-# We only care about dates from arrival onward.
 EARLIEST_RELEVANT_DAY = 18
 
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -60,56 +39,34 @@ DEBUG_SCREENSHOT = Path(__file__).parent / "debug_screenshot.png"
 DEBUG_HTML = Path(__file__).parent / "debug_page.html"
 
 MONTH_NAMES_EN = [
-    "january",
-    "february",
-    "march",
-    "april",
-    "may",
-    "june",
-    "july",
-    "august",
-    "september",
-    "october",
-    "november",
-    "december",
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
 ]
 MONTH_NAMES_NL = [
-    "januari",
-    "februari",
-    "maart",
-    "april",
-    "mei",
-    "juni",
-    "juli",
-    "augustus",
-    "september",
-    "oktober",
-    "november",
-    "december",
+    "januari", "februari", "maart", "april", "mei", "juni",
+    "juli", "augustus", "september", "oktober", "november", "december",
 ]
-MONTH_NAME_TO_NUM = {
-    **{name: i + 1 for i, name in enumerate(MONTH_NAMES_EN)},
-    **{name: i + 1 for i, name in enumerate(MONTH_NAMES_NL)},
-}
-MONTH_YEAR_RE = re.compile(
-    r"^(January|February|March|April|May|June|July|August|"
-    r"September|October|November|December|"
-    r"januari|februari|maart|april|mei|juni|juli|augustus|"
-    r"september|oktober|november|december)\s+(\d{4})$",
-    re.IGNORECASE,
-)
+
+MONTH_NAME_TO_NUM = {name: i + 1 for i, name in enumerate(MONTH_NAMES_EN)}
+MONTH_NAME_TO_NUM.update({name: i + 1 for i, name in enumerate(MONTH_NAMES_NL)})
 
 
 # ---------------------------------------------------------------------------
-# STATE
+# State
 # ---------------------------------------------------------------------------
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            return {"known_available_days": [], "last_failure_notified": False}
-    return {"known_available_days": [], "last_failure_notified": False}
+    if not STATE_FILE.exists():
+        return {"known_available_days": [], "last_failure_notified": False}
+
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("state.json is not a JSON object")
+        data.setdefault("known_available_days", [])
+        data.setdefault("last_failure_notified", False)
+        return data
+    except Exception:
+        return {"known_available_days": [], "last_failure_notified": False}
 
 
 def save_state(state: dict) -> None:
@@ -117,18 +74,15 @@ def save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# EMAIL
+# Email
 # ---------------------------------------------------------------------------
 def _smtp_port() -> int:
     raw = (os.getenv("SMTP_PORT") or "587").strip()
-    try:
-        return int(raw)
-    except ValueError:
-        return 587
+    return int(raw)
 
 
 def send_email(subject: str, body: str) -> None:
-    smtp_host = (os.getenv("SMTP_SERVER") or "smtp.gmail.com").strip() or "smtp.gmail.com"
+    smtp_host = os.getenv("SMTP_SERVER", "smtp.gmail.com")
     smtp_port = _smtp_port()
     from_addr = os.environ["EMAIL_FROM"]
     password = os.environ["EMAIL_PASSWORD"]
@@ -145,13 +99,40 @@ def send_email(subject: str, body: str) -> None:
         server.sendmail(from_addr, [to_addr], msg.as_string())
 
 
+def send_test_email() -> None:
+    send_email(
+        "RNI checker test email",
+        "This is a test email from the Breda RNI appointment checker.\n\n"
+        "If you received this, SMTP is working.",
+    )
+
+
 # ---------------------------------------------------------------------------
-# SCRAPING
+# Playwright helpers
 # ---------------------------------------------------------------------------
+def _month_year_pattern() -> re.Pattern[str]:
+    month_alt = "|".join(
+        [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+            "Januari", "Februari", "Maart", "April", "Mei", "Juni",
+            "Juli", "Augustus", "September", "Oktober", "November", "December",
+        ]
+    )
+    return re.compile(rf"(?im)^({month_alt})\s+(\d{{4}})$")
+
+
 def dismiss_cookie_banner(page) -> None:
-    for text in ["Accept", "Akkoord", "Alles accepteren", "Toestaan", "OK", "Accepteren"]:
+    for name in [
+        "Accept",
+        "Akkoord",
+        "Alles accepteren",
+        "Toestaan",
+        "OK",
+        "Accepteren",
+    ]:
         try:
-            btn = page.get_by_role("button", name=text, exact=False)
+            btn = page.get_by_role("button", name=name, exact=False)
             if btn.count() > 0:
                 btn.first.click(timeout=2000)
                 page.wait_for_timeout(500)
@@ -160,9 +141,17 @@ def dismiss_cookie_banner(page) -> None:
             pass
 
 
+def open_calendar_if_needed(page) -> None:
+    try:
+        opener = page.get_by_text("Click here to open the calendar", exact=False)
+        if opener.count() > 0 and opener.first.is_visible():
+            opener.first.click(timeout=3000)
+            page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+
 def click_through_intro_steps(page) -> None:
-    """Some booking widgets need you to click through a step or two before
-    showing the calendar."""
     for text in ["Next", "Continue", "Volgende", "Doorgaan", "Verder"]:
         try:
             btn = page.get_by_role("button", name=text, exact=False)
@@ -173,148 +162,229 @@ def click_through_intro_steps(page) -> None:
             pass
 
 
-def _page_text(page) -> str:
-    return page.locator("body").inner_text()
-
-
 def get_visible_month_year(page) -> Optional[tuple[int, int]]:
-    """Find an exact month/year heading like 'July 2026'."""
-    for raw_line in _page_text(page).splitlines():
-        line = " ".join(raw_line.split())
-        match = MONTH_YEAR_RE.match(line)
-        if not match:
+    """
+    Look for the visible calendar heading line like:
+    'July 2026'
+    This is safer than scanning the whole page for any month name.
+    """
+    try:
+        body_text = page.locator("body").inner_text()
+    except Exception:
+        return None
+
+    pattern = _month_year_pattern()
+    for line in body_text.splitlines():
+        line = line.strip()
+        m = pattern.match(line)
+        if not m:
             continue
-        month_name = match.group(1).lower()
+        month_name = m.group(1).lower()
+        year = int(m.group(2))
         month_num = MONTH_NAME_TO_NUM.get(month_name)
-        if month_num is None:
-            continue
-        return month_num, int(match.group(2))
+        if month_num:
+            return month_num, year
     return None
 
 
-def _click_first_visible(page, selectors: list[str]) -> bool:
-    for sel in selectors:
-        try:
-            loc = page.locator(sel)
-            if loc.count() == 0:
-                continue
-            el = loc.first
-            if el.is_visible():
-                el.click(timeout=2000)
-                return True
-        except Exception:
-            continue
+def _select_month_year_if_present(page, target_month: int, target_year: int) -> bool:
+    """
+    Some widgets expose native <select> controls. If present, use them.
+    Returns True if the widget appears to be on the target month/year.
+    """
+    try:
+        selects = page.locator("select")
+        if selects.count() < 2:
+            return False
+
+        target_month_name_en = MONTH_NAMES_EN[target_month - 1].title()
+        target_month_name_nl = MONTH_NAMES_NL[target_month - 1].title()
+
+        month_select = selects.nth(0)
+        year_select = selects.nth(1)
+
+        for month_label in (target_month_name_en, target_month_name_nl):
+            try:
+                month_select.select_option(label=month_label)
+                year_select.select_option(label=str(target_year))
+                page.wait_for_timeout(1000)
+                if get_visible_month_year(page) == (target_month, target_year):
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return False
 
 
 def navigate_to_target_month(page, target_month: int, target_year: int, max_clicks: int = 24) -> bool:
-    next_selectors = [
-        'button:has-text("Next month")',
-        'button:has-text("Next")',
-        'button[aria-label*="next month" i]',
-        'button[aria-label*="next" i]',
-        'a[aria-label*="next" i]',
-        'button:has-text(">")',
-        '[class*="next" i]',
-    ]
-    prev_selectors = [
-        'button:has-text("Previous month")',
-        'button:has-text("Previous")',
-        'button[aria-label*="previous month" i]',
-        'button[aria-label*="previous" i]',
-        'a[aria-label*="previous" i]',
-        'button:has-text("<")',
-        '[class*="previous" i]',
-        '[class*="prev" i]',
-    ]
+    """
+    First try native month/year selects. If that fails, click the real 'Next month'
+    button until the visible heading matches the target month/year.
+    """
+    if get_visible_month_year(page) == (target_month, target_year):
+        return True
 
-    target_index = target_year * 12 + target_month
+    if _select_month_year_if_present(page, target_month, target_year):
+        return True
+
+    next_button_candidates = [
+        page.get_by_role("button", name="Next month", exact=False),
+        page.get_by_role("button", name="Volgende maand", exact=False),
+        page.locator('button:has-text("Next month")'),
+        page.locator('button:has-text("Volgende maand")'),
+        page.locator('button[aria-label*="next" i]'),
+        page.locator('button[aria-label*="volgende" i]'),
+        page.locator('a[aria-label*="next" i]'),
+        page.locator('a[aria-label*="volgende" i]'),
+        page.locator('button:has-text(">")'),
+    ]
 
     for _ in range(max_clicks):
-        current = get_visible_month_year(page)
-        if current == (target_month, target_year):
+        if get_visible_month_year(page) == (target_month, target_year):
             return True
 
-        if current is None:
-            moved = _click_first_visible(page, next_selectors)
-        else:
-            current_index = current[1] * 12 + current[0]
-            if current_index < target_index:
-                moved = _click_first_visible(page, next_selectors)
-            else:
-                moved = _click_first_visible(page, prev_selectors)
+        clicked = False
+        for candidate in next_button_candidates:
+            try:
+                if candidate.count() > 0 and candidate.first.is_visible():
+                    candidate.first.click(timeout=2500)
+                    page.wait_for_timeout(900)
+                    clicked = True
+                    break
+            except Exception:
+                continue
 
-        if not moved:
+        if not clicked:
             break
-
-        page.wait_for_timeout(700)
 
     return get_visible_month_year(page) == (target_month, target_year)
 
 
-def extract_available_days(page, month_num: int) -> list[int]:
-    """Parse the page text for blocks like:
-       21
-       July 21
-       Date is available
+def extract_available_days(page) -> list[int]:
     """
-    month_name = MONTH_NAMES_EN[month_num - 1].capitalize()
-    text = _page_text(page)
+    Return available day numbers from the currently visible calendar.
+    This uses several text/ARIA heuristics because the widget is not a standard API.
+    """
+    available: set[int] = set()
 
-    pattern = re.compile(
-        rf"(?ims)(?:^|\n)\s*(\d{{1,2}})\s+{re.escape(month_name)}\s+\1\s+Date is available\b"
-    )
-    days = [int(m.group(1)) for m in pattern.finditer(text)]
-    return sorted(set(days))
+    selectors = [
+        "button",
+        "a",
+        "td",
+        '[role="button"]',
+        '[role="option"]',
+        "[aria-label]",
+        "[title]",
+    ]
+
+    seen = set()
+
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = loc.count()
+        except Exception:
+            continue
+
+        for i in range(count):
+            el = loc.nth(i)
+            try:
+                if not el.is_visible():
+                    continue
+            except Exception:
+                continue
+
+            try:
+                text = el.inner_text().strip()
+            except Exception:
+                text = ""
+
+            try:
+                aria = (el.get_attribute("aria-label") or "").strip()
+            except Exception:
+                aria = ""
+
+            try:
+                title = (el.get_attribute("title") or "").strip()
+            except Exception:
+                title = ""
+
+            payload = " ".join(part for part in [aria, title, text] if part).strip()
+            if not payload:
+                continue
+
+            key = payload[:200]
+            if key in seen:
+                continue
+            seen.add(key)
+
+            lower = payload.lower()
+            if "date is available" not in lower:
+                continue
+
+            # Parse the first 1-31 number we can find in the cell label/text.
+            nums = re.findall(r"\b(\d{1,2})\b", payload)
+            for n in nums:
+                day = int(n)
+                if 1 <= day <= 31:
+                    available.add(day)
+                    break
+
+    return sorted(available)
 
 
 def check_appointments() -> list[int]:
-    """Return a sorted list of available day numbers in the target month.
-    Raises RuntimeError if the page structure couldn't be understood."""
+    """
+    Returns a sorted list of available day numbers for the target month.
+    Raises RuntimeError if the page structure cannot be understood.
+    """
+    from playwright.sync_api import sync_playwright  # local import so --test-email works without Playwright
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
+
         try:
             page.goto(BOOKING_URL, wait_until="networkidle", timeout=60000)
             dismiss_cookie_banner(page)
+            open_calendar_if_needed(page)
             click_through_intro_steps(page)
             page.wait_for_timeout(1500)
 
             reached = navigate_to_target_month(page, TARGET_MONTH, TARGET_YEAR)
+
             if not reached:
                 page.screenshot(path=str(DEBUG_SCREENSHOT), full_page=True)
-                DEBUG_HTML.write_text(page.content())
+                DEBUG_HTML.write_text(page.content(), encoding="utf-8")
                 raise RuntimeError(
                     "Could not navigate to the target month. "
                     "Saved debug_screenshot.png and debug_page.html for troubleshooting."
                 )
 
-            available_days = extract_available_days(page, TARGET_MONTH)
+            available_days = extract_available_days(page)
             return available_days
         finally:
             browser.close()
 
 
 # ---------------------------------------------------------------------------
-# MAIN
+# Main
 # ---------------------------------------------------------------------------
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description="Breda RNI appointment checker")
     parser.add_argument(
         "--test-email",
         action="store_true",
-        help="Send a one-off test email using the configured SMTP settings and exit.",
+        help="Send a test email and exit without running the scraper",
     )
     args = parser.parse_args()
 
     if args.test_email:
-        send_email(
-            "RNI checker test email",
-            "This is a test email from the Breda RNI appointment checker.\n\n"
-            "If you can read this, SMTP is working.",
-        )
-        print("Test email sent.")
-        return
+        send_test_email()
+        print("Test email sent successfully.")
+        return 0
 
     state = load_state()
 
@@ -322,22 +392,23 @@ def main() -> None:
         available_days = check_appointments()
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+
         if not state.get("last_failure_notified"):
             try:
                 send_email(
                     "RNI checker: script needs attention",
-                    "The Breda RNI appointment checker hit an error and couldn't "
+                    "The Breda RNI appointment checker hit an error and could not "
                     f"read the calendar:\n\n{exc}\n\n"
-                    "Check the GitHub Actions run's uploaded debug files "
+                    "Check the GitHub Actions run logs and the debug artifacts "
                     "(debug_screenshot.png / debug_page.html) to see what changed.",
                 )
                 state["last_failure_notified"] = True
                 save_state(state)
             except Exception as email_exc:
                 print(f"Also failed to send failure email: {email_exc}", file=sys.stderr)
-        sys.exit(1)
 
-    # success -> clear failure flag
+        return 1
+
     if state.get("last_failure_notified"):
         state["last_failure_notified"] = False
 
@@ -361,6 +432,7 @@ def main() -> None:
         for d in new_days:
             marker = "  <-- your preferred date!" if d == PREFERRED_DAY else ""
             lines.append(f"  - August {d}{marker}")
+
         lines += [
             "",
             f"Book here (dates fill fast): {BOOKING_URL}",
@@ -371,7 +443,8 @@ def main() -> None:
 
     state["known_available_days"] = relevant_days
     save_state(state)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
