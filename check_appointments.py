@@ -142,13 +142,21 @@ def dismiss_cookie_banner(page) -> None:
 
 
 def open_calendar_if_needed(page) -> None:
-    try:
-        opener = page.get_by_text("Click here to open the calendar", exact=False)
-        if opener.count() > 0 and opener.first.is_visible():
-            opener.first.click(timeout=3000)
-            page.wait_for_timeout(800)
-    except Exception:
-        pass
+    candidates = [
+        page.get_by_text("Click here to open the calendar", exact=False),
+        page.get_by_role("button", name=re.compile(r"calendar", re.I)),
+        page.locator('button[aria-label*="calendar" i]'),
+        page.locator('button[title*="calendar" i]'),
+    ]
+
+    for candidate in candidates:
+        try:
+            if candidate.count() > 0 and candidate.first.is_visible():
+                candidate.first.click(timeout=3000)
+                page.wait_for_timeout(1200)
+                return
+        except Exception:
+            pass
 
 
 def click_through_intro_steps(page) -> None:
@@ -187,33 +195,27 @@ def get_visible_month_year(page):
     return None
 
 
-def navigate_to_target_month(page, target_month: int, target_year: int, max_clicks: int = 14) -> bool:
-    """
-    Use the Month/Year dropdowns directly. This page exposes them, so do not
-    rely on body text or arrow-button guessing.
-    """
+def navigate_to_target_month(page, target_month: int, target_year: int, max_clicks: int = 24) -> bool:
+    open_calendar_if_needed(page)
+    page.wait_for_timeout(800)
+
     try:
         selects = page.locator("select")
         if selects.count() >= 2:
             month_select = selects.nth(0)
             year_select = selects.nth(1)
 
-            target_month_name = MONTH_NAMES_EN[target_month - 1].title()
-
-            # Try English month label first, then Dutch.
             try:
-                month_select.select_option(label=target_month_name)
+                month_select.select_option(label=MONTH_NAMES_EN[target_month - 1].title())
             except Exception:
                 month_select.select_option(label=MONTH_NAMES_NL[target_month - 1].title())
 
             year_select.select_option(label=str(target_year))
             page.wait_for_timeout(1200)
-
             return get_visible_month_year(page) == (target_month, target_year)
     except Exception:
         pass
 
-    # Fallback to button clicking if dropdowns are not available for some reason.
     next_selectors = [
         'button:has-text("Next month")',
         'button:has-text("Volgende maand")',
