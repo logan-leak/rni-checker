@@ -144,8 +144,8 @@ def click_any_visible(page, patterns) -> bool:
 
 def advance_to_step_3(page) -> None:
     """
-    The Breda flow shows Step 2 first, so click through to Step 3 before
-    looking for the calendar.
+    The Breda flow may land on Step 2 first, so click through to Step 3 before
+    looking for the calendar. If already on Step 3, returns immediately.
     """
     for _ in range(6):
         body = page.locator("body").inner_text().lower()
@@ -209,6 +209,15 @@ def _option_texts(select_locator) -> list[str]:
     return texts
 
 
+def _month_aliases(month_idx: int) -> list[str]:
+    en = MONTH_NAMES_EN[month_idx - 1]
+    nl = MONTH_NAMES_NL[month_idx - 1]
+    return [
+        en, en[:3], en.title(), en[:3].title(),
+        nl, nl[:3], nl.title(), nl[:3].title(),
+    ]
+
+
 def _find_month_year_selects(page):
     """
     Try to identify the month and year <select> elements from the visible
@@ -224,9 +233,10 @@ def _find_month_year_selects(page):
     for i in range(selects.count()):
         sel = selects.nth(i)
         option_texts = [t.lower() for t in _option_texts(sel)]
+        joined = " ".join(option_texts)
 
         if month_select is None:
-            if any(m in " ".join(option_texts) for m in MONTH_NAMES_EN + MONTH_NAMES_NL):
+            if any(m in joined for m in MONTH_NAMES_EN + MONTH_NAMES_NL):
                 month_select = sel
                 continue
 
@@ -244,19 +254,25 @@ def _find_month_year_selects(page):
 
 
 def _select_option_by_text(select_locator, target_texts: list[str]) -> bool:
+    target_set = {t.strip().lower() for t in target_texts if t.strip()}
+
     try:
         options = select_locator.locator("option")
         count = options.count()
         for i in range(count):
             option = options.nth(i)
             text = (option.inner_text() or "").strip().lower()
-            value = (option.get_attribute("value") or "").strip()
-            if any(t.lower() == text or t.lower() in text for t in target_texts):
-                if value:
-                    select_locator.select_option(value=value)
-                else:
+            value = (option.get_attribute("value") or "").strip().lower()
+
+            for target in target_set:
+                if (
+                    text == target
+                    or text.startswith(target)
+                    or target.startswith(text)
+                    or value == target
+                ):
                     select_locator.select_option(index=i)
-                return True
+                    return True
     except Exception:
         pass
 
@@ -275,22 +291,16 @@ def select_target_month_year(page, target_month: int, target_year: int) -> bool:
     if month_select is None or year_select is None:
         return False
 
-    target_month_en = MONTH_NAMES_EN[target_month - 1].title()
-    target_month_nl = MONTH_NAMES_NL[target_month - 1].title()
-
-    try:
-        ok_month = _select_option_by_text(month_select, [target_month_en, target_month_nl])
-        if not ok_month:
-            return False
-
-        ok_year = _select_option_by_text(year_select, [str(target_year)])
-        if not ok_year:
-            return False
-
-        page.wait_for_timeout(1500)
-        return True
-    except Exception:
+    ok_month = _select_option_by_text(month_select, _month_aliases(target_month))
+    if not ok_month:
         return False
+
+    ok_year = _select_option_by_text(year_select, [str(target_year)])
+    if not ok_year:
+        return False
+
+    page.wait_for_timeout(1500)
+    return True
 
 
 def get_visible_month_year(page) -> Optional[tuple[int, int]]:
