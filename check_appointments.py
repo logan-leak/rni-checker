@@ -4,7 +4,8 @@ Breda RNI appointment checker.
 
 What this script does:
 - Opens the Breda RNI booking page with Playwright.
-- Navigates to August 2026.
+- Advances to the date/time selection step.
+- Selects August 2026.
 - Detects which days are available.
 - Sends an email when new relevant openings appear.
 - Supports --test-email to verify SMTP without needing Playwright.
@@ -25,7 +26,7 @@ import smtplib
 import sys
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 BOOKING_URL = "https://breda.mijnafspraakmaken.nl/?lang=en&link=6adf&product=45"
 
@@ -46,13 +47,12 @@ MONTH_NAMES_NL = [
     "januari", "februari", "maart", "april", "mei", "juni",
     "juli", "augustus", "september", "oktober", "november", "december",
 ]
-
 MONTH_NAME_TO_NUM = {name: i + 1 for i, name in enumerate(MONTH_NAMES_EN)}
 MONTH_NAME_TO_NUM.update({name: i + 1 for i, name in enumerate(MONTH_NAMES_NL)})
 
 
 # ---------------------------------------------------------------------------
-# State
+# STATE
 # ---------------------------------------------------------------------------
 def load_state() -> dict:
     if not STATE_FILE.exists():
@@ -74,7 +74,7 @@ def save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Email
+# EMAIL
 # ---------------------------------------------------------------------------
 def _smtp_port() -> int:
     raw = (os.getenv("SMTP_PORT") or "587").strip()
@@ -108,37 +108,73 @@ def send_test_email() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Playwright helpers
+# PAGE HELPERS
 # ---------------------------------------------------------------------------
-def _month_year_pattern() -> re.Pattern[str]:
-    month_alt = "|".join(
-        [
-            "January", "February", "March", "April", "May", "June",
-            "July", "August", "September", "October", "November", "December",
-            "Januari", "Februari", "Maart", "April", "Mei", "Juni",
-            "Juli", "Augustus", "September", "Oktober", "November", "December",
-        ]
-    )
-    return re.compile(rf"(?im)^({month_alt})\s+(\d{{4}})$")
-
-
 def dismiss_cookie_banner(page) -> None:
-    for name in [
-        "Accept",
-        "Akkoord",
-        "Alles accepteren",
-        "Toestaan",
-        "OK",
-        "Accepteren",
-    ]:
+    for name in ["Accept", "Akkoord", "Alles accepteren", "Toestaan", "OK", "Accepteren"]:
         try:
             btn = page.get_by_role("button", name=name, exact=False)
-            if btn.count() > 0:
+            if btn.count() > 0 and btn.first.is_visible():
                 btn.first.click(timeout=2000)
                 page.wait_for_timeout(500)
                 return
         except Exception:
             pass
+
+
+def click_any_visible(page, patterns) -> bool:
+    for pattern in patterns:
+        candidates = [
+            page.get_by_role("button", name=re.compile(pattern, re.I)),
+            page.get_by_role("link", name=re.compile(pattern, re.I)),
+            page.get_by_text(re.compile(pattern, re.I)),
+            page.locator(f'button:has-text("{pattern}")'),
+            page.locator(f'a:has-text("{pattern}")'),
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.count() > 0 and candidate.first.is_visible():
+                    candidate.first.click(timeout=3000)
+                    page.wait_for_timeout(1200)
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def advance_to_step_3(page) -> None:
+    """
+    The Breda flow shows Step 2 first, so click through to Step 3 before
+    looking for the calendar.
+    """
+    for _ in range(6):
+        body = page.locator("body").inner_text().lower()
+
+        if "step 3 of 5: select a date and time" in body:
+            return
+
+        if "step 2 of 5: things to keep in mind" in body:
+            clicked = click_any_visible(page, [
+                "Continue to step 3",
+                "Continue",
+                "Doorgaan",
+                "Volgende",
+                "Next",
+            ])
+        else:
+            clicked = click_any_visible(page, [
+                "Continue to step 4",
+                "Continue to step 3",
+                "Continue",
+                "Doorgaan",
+                "Volgende",
+                "Next",
+            ])
+
+        if not clicked:
+            break
+
+    raise RuntimeError("Could not advance to step 3.")
 
 
 def open_calendar_if_needed(page) -> None:
@@ -159,62 +195,168 @@ def open_calendar_if_needed(page) -> None:
             pass
 
 
-def click_through_intro_steps(page) -> None:
-    for text in ["Next", "Continue", "Volgende", "Doorgaan", "Verder"]:
+def _option_texts(select_locator) -> list[str]:
+    texts: list[str] = []
+    try:
+        options = select_locator.locator("option")
+        count = options.count()
+        for i in range(count):
+            txt = (options.nth(i).inner_text() or "").strip()
+            if txt:
+                texts.append(txt)
+    except Exception:
+        pass
+    return texts
+
+
+def _find_month_year_selects(page):
+    """
+    Try to identify the month and year <select> elements from the visible
+    dropdowns.
+    """
+    selects = page.locator("select")
+    if selects.count() < 2:
+        return None, None
+
+    month_select = None
+    year_select = None
+
+    for i in range(selects.count()):
+        sel = selects.nth(i)
+        option_texts = [t.lower() for t in _option_texts(sel)]
+
+        if month_select is None:
+            if any(m in " ".join(option_texts) for m in MONTH_NAMES_EN + MONTH_NAMES_NL):
+                month_select = sel
+                continue
+
+        if year_select is None:
+            if any(re.fullmatch(r"20\d{2}", t) for t in option_texts):
+                year_select = sel
+                continue
+
+    if month_select is None:
+        month_select = selects.nth(0)
+    if year_select is None:
+        year_select = selects.nth(1) if selects.count() > 1 else None
+
+    return month_select, year_select
+
+
+def _select_option_by_text(select_locator, target_texts: list[str]) -> bool:
+    try:
+        options = select_locator.locator("option")
+        count = options.count()
+        for i in range(count):
+            option = options.nth(i)
+            text = (option.inner_text() or "").strip().lower()
+            value = (option.get_attribute("value") or "").strip()
+            if any(t.lower() == text or t.lower() in text for t in target_texts):
+                if value:
+                    select_locator.select_option(value=value)
+                else:
+                    select_locator.select_option(index=i)
+                return True
+    except Exception:
+        pass
+
+    for txt in target_texts:
         try:
-            btn = page.get_by_role("button", name=text, exact=False)
-            if btn.count() > 0 and btn.first.is_visible():
-                btn.first.click(timeout=2000)
-                page.wait_for_timeout(800)
+            select_locator.select_option(label=txt)
+            return True
         except Exception:
             pass
 
+    return False
 
-def get_visible_month_year(page):
+
+def select_target_month_year(page, target_month: int, target_year: int) -> bool:
+    month_select, year_select = _find_month_year_selects(page)
+    if month_select is None or year_select is None:
+        return False
+
+    target_month_en = MONTH_NAMES_EN[target_month - 1].title()
+    target_month_nl = MONTH_NAMES_NL[target_month - 1].title()
+
+    try:
+        ok_month = _select_option_by_text(month_select, [target_month_en, target_month_nl])
+        if not ok_month:
+            return False
+
+        ok_year = _select_option_by_text(year_select, [str(target_year)])
+        if not ok_year:
+            return False
+
+        page.wait_for_timeout(1500)
+        return True
+    except Exception:
+        return False
+
+
+def get_visible_month_year(page) -> Optional[tuple[int, int]]:
     """
-    Read the actual Month/Year dropdowns instead of scanning the whole page.
+    Read the current month/year from the visible select controls if possible,
+    otherwise from a heading line in the page text.
     """
     try:
-        selects = page.locator("select")
-        if selects.count() < 2:
-            return None
+        month_select, year_select = _find_month_year_selects(page)
+        if month_select is not None and year_select is not None:
+            month_text = ""
+            year_text = ""
 
-        month_select = selects.nth(0)
-        year_select = selects.nth(1)
+            try:
+                month_text = month_select.locator("option:checked").inner_text().strip().lower()
+            except Exception:
+                pass
 
-        month_label = (
-            month_select.locator("option:checked").inner_text().strip().lower()
-        )
-        year_text = year_select.locator("option:checked").inner_text().strip()
+            try:
+                year_text = year_select.locator("option:checked").inner_text().strip()
+            except Exception:
+                pass
 
-        if month_label in MONTH_NAME_TO_NUM and year_text.isdigit():
-            return MONTH_NAME_TO_NUM[month_label], int(year_text)
+            if month_text in MONTH_NAME_TO_NUM and year_text.isdigit():
+                return MONTH_NAME_TO_NUM[month_text], int(year_text)
     except Exception:
         pass
+
+    try:
+        body_text = page.locator("body").inner_text()
+    except Exception:
+        return None
+
+    month_alt = "|".join([
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+        "Januari", "Februari", "Maart", "April", "Mei", "Juni",
+        "Juli", "Augustus", "September", "Oktober", "November", "December",
+    ])
+    pattern = re.compile(rf"(?im)^({month_alt})\s+(\d{{4}})$")
+
+    for line in body_text.splitlines():
+        line = line.strip()
+        m = pattern.match(line)
+        if not m:
+            continue
+        month_name = m.group(1).lower()
+        year = int(m.group(2))
+        month_num = MONTH_NAME_TO_NUM.get(month_name)
+        if month_num:
+            return month_num, year
 
     return None
 
 
 def navigate_to_target_month(page, target_month: int, target_year: int, max_clicks: int = 24) -> bool:
-    open_calendar_if_needed(page)
-    page.wait_for_timeout(800)
+    """
+    Prefer direct dropdown selection. If that fails, fall back to clicking
+    a next-month button.
+    """
+    current = get_visible_month_year(page)
+    if current == (target_month, target_year):
+        return True
 
-    try:
-        selects = page.locator("select")
-        if selects.count() >= 2:
-            month_select = selects.nth(0)
-            year_select = selects.nth(1)
-
-            try:
-                month_select.select_option(label=MONTH_NAMES_EN[target_month - 1].title())
-            except Exception:
-                month_select.select_option(label=MONTH_NAMES_NL[target_month - 1].title())
-
-            year_select.select_option(label=str(target_year))
-            page.wait_for_timeout(1200)
-            return get_visible_month_year(page) == (target_month, target_year)
-    except Exception:
-        pass
+    if select_target_month_year(page, target_month, target_year):
+        return get_visible_month_year(page) == (target_month, target_year)
 
     next_selectors = [
         'button:has-text("Next month")',
@@ -249,43 +391,12 @@ def navigate_to_target_month(page, target_month: int, target_year: int, max_clic
     return get_visible_month_year(page) == (target_month, target_year)
 
 
-def _select_month_year_if_present(page, target_month: int, target_year: int) -> bool:
-    """
-    Some widgets expose native <select> controls. If present, use them.
-    Returns True if the widget appears to be on the target month/year.
-    """
-    try:
-        selects = page.locator("select")
-        if selects.count() < 2:
-            return False
-
-        target_month_name_en = MONTH_NAMES_EN[target_month - 1].title()
-        target_month_name_nl = MONTH_NAMES_NL[target_month - 1].title()
-
-        month_select = selects.nth(0)
-        year_select = selects.nth(1)
-
-        for month_label in (target_month_name_en, target_month_name_nl):
-            try:
-                month_select.select_option(label=month_label)
-                year_select.select_option(label=str(target_year))
-                page.wait_for_timeout(1000)
-                if get_visible_month_year(page) == (target_month, target_year):
-                    return True
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return False
-
-
 def extract_available_days(page) -> list[int]:
     """
-    Return available day numbers from the currently visible calendar.
-    This uses several text/ARIA heuristics because the widget is not a standard API.
+    Return available day numbers from the visible calendar.
     """
     available: set[int] = set()
+    seen: set[str] = set()
 
     selectors = [
         "button",
@@ -297,8 +408,6 @@ def extract_available_days(page) -> list[int]:
         "[title]",
     ]
 
-    seen = set()
-
     for sel in selectors:
         try:
             loc = page.locator(sel)
@@ -308,6 +417,7 @@ def extract_available_days(page) -> list[int]:
 
         for i in range(count):
             el = loc.nth(i)
+
             try:
                 if not el.is_visible():
                     continue
@@ -342,7 +452,6 @@ def extract_available_days(page) -> list[int]:
             if "date is available" not in lower:
                 continue
 
-            # Parse the first 1-31 number we can find in the cell label/text.
             nums = re.findall(r"\b(\d{1,2})\b", payload)
             for n in nums:
                 day = int(n)
@@ -355,7 +464,7 @@ def extract_available_days(page) -> list[int]:
 
 def check_appointments() -> list[int]:
     """
-    Returns a sorted list of available day numbers for the target month.
+    Returns a sorted list of available day numbers for August 2026.
     Raises RuntimeError if the page structure cannot be understood.
     """
     from playwright.sync_api import sync_playwright  # local import so --test-email works without Playwright
@@ -367,12 +476,11 @@ def check_appointments() -> list[int]:
         try:
             page.goto(BOOKING_URL, wait_until="networkidle", timeout=60000)
             dismiss_cookie_banner(page)
+            advance_to_step_3(page)
             open_calendar_if_needed(page)
-            click_through_intro_steps(page)
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1200)
 
             reached = navigate_to_target_month(page, TARGET_MONTH, TARGET_YEAR)
-
             if not reached:
                 page.screenshot(path=str(DEBUG_SCREENSHOT), full_page=True)
                 DEBUG_HTML.write_text(page.content(), encoding="utf-8")
@@ -388,7 +496,7 @@ def check_appointments() -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# MAIN
 # ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(description="Breda RNI appointment checker")
