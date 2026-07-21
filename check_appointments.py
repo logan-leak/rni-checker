@@ -162,29 +162,89 @@ def click_through_intro_steps(page) -> None:
             pass
 
 
-def get_visible_month_year(page) -> Optional[tuple[int, int]]:
+def get_visible_month_year(page):
     """
-    Look for the visible calendar heading line like:
-    'July 2026'
-    This is safer than scanning the whole page for any month name.
+    Read the actual Month/Year dropdowns instead of scanning the whole page.
     """
     try:
-        body_text = page.locator("body").inner_text()
-    except Exception:
-        return None
+        selects = page.locator("select")
+        if selects.count() < 2:
+            return None
 
-    pattern = _month_year_pattern()
-    for line in body_text.splitlines():
-        line = line.strip()
-        m = pattern.match(line)
-        if not m:
-            continue
-        month_name = m.group(1).lower()
-        year = int(m.group(2))
-        month_num = MONTH_NAME_TO_NUM.get(month_name)
-        if month_num:
-            return month_num, year
+        month_select = selects.nth(0)
+        year_select = selects.nth(1)
+
+        month_label = (
+            month_select.locator("option:checked").inner_text().strip().lower()
+        )
+        year_text = year_select.locator("option:checked").inner_text().strip()
+
+        if month_label in MONTH_NAME_TO_NUM and year_text.isdigit():
+            return MONTH_NAME_TO_NUM[month_label], int(year_text)
+    except Exception:
+        pass
+
     return None
+
+
+def navigate_to_target_month(page, target_month: int, target_year: int, max_clicks: int = 14) -> bool:
+    """
+    Use the Month/Year dropdowns directly. This page exposes them, so do not
+    rely on body text or arrow-button guessing.
+    """
+    try:
+        selects = page.locator("select")
+        if selects.count() >= 2:
+            month_select = selects.nth(0)
+            year_select = selects.nth(1)
+
+            target_month_name = MONTH_NAMES_EN[target_month - 1].title()
+
+            # Try English month label first, then Dutch.
+            try:
+                month_select.select_option(label=target_month_name)
+            except Exception:
+                month_select.select_option(label=MONTH_NAMES_NL[target_month - 1].title())
+
+            year_select.select_option(label=str(target_year))
+            page.wait_for_timeout(1200)
+
+            return get_visible_month_year(page) == (target_month, target_year)
+    except Exception:
+        pass
+
+    # Fallback to button clicking if dropdowns are not available for some reason.
+    next_selectors = [
+        'button:has-text("Next month")',
+        'button:has-text("Volgende maand")',
+        'button[aria-label*="next" i]',
+        'button[aria-label*="volgende" i]',
+        'a[aria-label*="next" i]',
+        'a[aria-label*="volgende" i]',
+        'button:has-text(">")',
+    ]
+
+    for _ in range(max_clicks):
+        current = get_visible_month_year(page)
+        if current == (target_month, target_year):
+            return True
+
+        clicked = False
+        for sel in next_selectors:
+            try:
+                locator = page.locator(sel)
+                if locator.count() > 0 and locator.first.is_visible():
+                    locator.first.click(timeout=2000)
+                    page.wait_for_timeout(900)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            break
+
+    return get_visible_month_year(page) == (target_month, target_year)
 
 
 def _select_month_year_if_present(page, target_month: int, target_year: int) -> bool:
@@ -216,50 +276,6 @@ def _select_month_year_if_present(page, target_month: int, target_year: int) -> 
         pass
 
     return False
-
-
-def navigate_to_target_month(page, target_month: int, target_year: int, max_clicks: int = 24) -> bool:
-    """
-    First try native month/year selects. If that fails, click the real 'Next month'
-    button until the visible heading matches the target month/year.
-    """
-    if get_visible_month_year(page) == (target_month, target_year):
-        return True
-
-    if _select_month_year_if_present(page, target_month, target_year):
-        return True
-
-    next_button_candidates = [
-        page.get_by_role("button", name="Next month", exact=False),
-        page.get_by_role("button", name="Volgende maand", exact=False),
-        page.locator('button:has-text("Next month")'),
-        page.locator('button:has-text("Volgende maand")'),
-        page.locator('button[aria-label*="next" i]'),
-        page.locator('button[aria-label*="volgende" i]'),
-        page.locator('a[aria-label*="next" i]'),
-        page.locator('a[aria-label*="volgende" i]'),
-        page.locator('button:has-text(">")'),
-    ]
-
-    for _ in range(max_clicks):
-        if get_visible_month_year(page) == (target_month, target_year):
-            return True
-
-        clicked = False
-        for candidate in next_button_candidates:
-            try:
-                if candidate.count() > 0 and candidate.first.is_visible():
-                    candidate.first.click(timeout=2500)
-                    page.wait_for_timeout(900)
-                    clicked = True
-                    break
-            except Exception:
-                continue
-
-        if not clicked:
-            break
-
-    return get_visible_month_year(page) == (target_month, target_year)
 
 
 def extract_available_days(page) -> list[int]:
