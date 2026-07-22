@@ -1,4 +1,6 @@
 {
-  "known_available_days": [],
-  "last_failure_notified": true
+  "known_available_days": [
+    0
+  ],
+  "last_failure_notified": false
 }
